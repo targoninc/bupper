@@ -1,5 +1,5 @@
-using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.IO.Compression;
 using Bupper.Models;
 using Bupper.Models.Settings;
 using Microsoft.Extensions.Options;
@@ -141,55 +141,74 @@ public class Worker(
         string file, ProgressTask task)
     {
         string relativePath = Path.GetRelativePath(localPath, file);
-        string remotePath = Path.Combine(target.Folder, targetPath, relativePath).Replace("\\", "/");
-                        
+        string remotePath =
+            Path.Combine(target.Folder, targetPath, relativePath).Replace("\\", "/") + ".gz"; // Add .gz extension
+
         string? fileFolder = Path.GetDirectoryName(relativePath);
         string uploadFolder = (target.Folder + "/" + targetPath + "/" + fileFolder).Replace("\\", "/");
         await CreateDirectoryIfNotExists(client, uploadFolder);
 
-        await using FileStream fileStream = new(file, FileMode.Open);
-                        
         if (!LocalFileIsNewer(client, file, remotePath) && FileSizesAreEqual(client, file, remotePath))
         {
             task.Increment(1);
             return;
         }
-        
+
         const int maxRetries = 3;
         for (int i = 0; i < maxRetries; i++)
         {
             try
             {
-                IAsyncResult asyncResult = client.BeginUploadFile(fileStream, remotePath);
+                await using FileStream fileStream = new(file, FileMode.Open, FileAccess.Read);
+                await using MemoryStream compressedStream = new();
+                await using GZipStream compressionStream = new(compressedStream, CompressionMode.Compress);
+
+                // Compress the file stream
+                await fileStream.CopyToAsync(compressionStream);
+
+                // Reset the position of the compressed stream for reading
+                compressedStream.Seek(0, SeekOrigin.Begin);
+
+                // Upload the compressed data stream
+                IAsyncResult asyncResult = client.BeginUploadFile(compressedStream, remotePath);
                 await Task.Factory.FromAsync(asyncResult, client.EndUploadFile);
+
                 break;
-            } catch (Exception e)
+            }
+            catch (Exception e)
             {
                 if (i == maxRetries - 1)
                 {
-                    logger.LogError(e, "Failed to upload file: {File} to {RemoteFile} into {Folder}", file, remotePath, uploadFolder);
+                    logger.LogError(e, "Failed to upload file: {File} to {RemoteFile} into {Folder}", file, remotePath,
+                        uploadFolder);
                     throw;
                 }
-                
-                if (e.Message.Contains("The session is not open.") || e.Message.Contains("Cannot access a disposed object."))
+
+                if (e.Message.Contains("The session is not open.") ||
+                    e.Message.Contains("Cannot access a disposed object."))
                 {
-                    await SftpConnectionSemaphore.WaitAsync();
-                    try
-                    {
-                        if (!client.IsConnected)
-                        {
-                            await client.ConnectAsync(default);
-                        }
-                    }
-                    finally
-                    {
-                        SftpConnectionSemaphore.Release();                        
-                    }
+                    await TryToReconnectSftp(client);
                 }
             }
         }
 
         task.Increment(1);
+    }
+
+    private static async Task TryToReconnectSftp(SftpClient client)
+    {
+        await SftpConnectionSemaphore.WaitAsync();
+        try
+        {
+            if (!client.IsConnected)
+            {
+                await client.ConnectAsync(default);
+            }
+        }
+        finally
+        {
+            SftpConnectionSemaphore.Release();                        
+        }
     }
 
     private static bool LocalFileIsNewer(SftpClient client, string localPath, string remotePath)
