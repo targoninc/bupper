@@ -1,8 +1,10 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using Bupper.Models;
 using Bupper.Models.Settings;
 using Microsoft.Extensions.Options;
 using Renci.SshNet;
+using Renci.SshNet.Common;
 using Renci.SshNet.Sftp;
 using Spectre.Console;
 
@@ -31,7 +33,7 @@ public class Worker(
                 await SyncFolder(folder);
             }
             
-            await Task.Delay(10000, stoppingToken);
+            await Task.Delay(60000, stoppingToken);
         }
     }
 
@@ -50,65 +52,51 @@ public class Worker(
         logger.LogInformation("Syncing projects root: {Path}", basePath);
         foreach (BupperTarget target in settings.CurrentValue.Targets)
         {
+            using SftpClient client = new(target.Host, target.User, KeyFile);
+            await client.ConnectAsync(default);
+
+            await CreateDirectoryIfNotExists(client, target.Folder + "/" + baseName);
+
             foreach (BupperDirectory project in directory.Directories)
             {
-                await SyncDirectory(basePath, baseName, project, target);
+                await SyncDirectory(client, basePath, baseName, project, target);
             }
+            client.Disconnect();
         }
     }
     
-    private async Task SyncDirectory(string baseFolder, string baseName, BupperDirectory directory, BupperTarget target)
+    private async Task SyncDirectory(SftpClient client, string baseFolder, string baseName, BupperDirectory directory,
+        BupperTarget target)
     {
         string dirRelative = directory.Path.Replace(baseFolder, "");
         string dir = dirRelative.TrimStart('\\');
         
         if (dir.Length > 0)
         {
-            CreateDirectoryIfNotExists(target, baseName + "/" + dir);
-            await UploadDirectory(directory.Path, target, baseName + "/" + dir);
+            await UploadDirectory(client, directory.Path, target, baseName + "/" + dir);
         }
         else
         {
-            CreateDirectoryIfNotExists(target, baseName);
-            await UploadDirectory(directory.Path, target, baseName);
+            await UploadDirectory(client, directory.Path, target, baseName);
         }
     }
     
-    private void CreateDirectoryIfNotExists(BupperTarget target, string targetPath)
+    private async Task CreateDirectoryIfNotExists(SftpClient client, string targetPath)
     {
-        logger.LogInformation("Creating directory: {TargetHost}", target.Host);
-        Process process = new()
+        try
         {
-            StartInfo = new ProcessStartInfo
-            {
-                FileName = "ssh",
-                Arguments = $"{target.User}@{target.Host} \"mkdir -p \\\"{target.Folder}/{targetPath}\\\"\"", // TODO: Fix shell injection
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true
-            }
-        };
-        logger.LogInformation("ssh " + process.StartInfo.Arguments);
-
-        process.Start();
-        process.WaitForExit();
-
-        if (process.ExitCode != 0)
+            await client.CreateDirectoryAsync(targetPath);
+        }
+        catch (Exception e)
         {
-            string lastError = process.StandardError.ReadToEnd();
-            logger.LogError(lastError);
-            string output = process.StandardOutput.ReadToEnd();
-            logger.LogError(output);
-            throw new Exception($"Failed to create directory on target: {target.Host}");
+            // ignored
         }
     }
 
-    private async Task UploadDirectory(string localPath, BupperTarget target, string targetPath)
+    private async Task UploadDirectory(SftpClient client, string localPath, BupperTarget target, string targetPath)
     {
         logger.LogInformation("Uploading directory: {LocalPath} to {TargetHost}", localPath, target.Host);
-        using SftpClient client = new(target.Host, target.User, KeyFile);
-        client.Connect();
+        await CreateDirectoryIfNotExists(client, target.Folder + "/" + targetPath);
 
         string[] files = Directory.GetFiles(localPath, "*", SearchOption.AllDirectories);
 
@@ -121,48 +109,89 @@ public class Worker(
                 await Task.WhenAll(files.Select(async file =>
                 {
                     await semaphore.WaitAsync();
+                    task.Description = $"[green]Uploading {20 - semaphore.CurrentCount}/{files.Length} files[/]";
                     try
                     {
-                        string relativePath = Path.GetRelativePath(localPath, file);
-                        string remotePath = Path.Combine(target.Folder, targetPath, relativePath).Replace("\\", "/");
-
-                        await using FileStream fileStream = new(file, FileMode.Open);
-                        
-                        if (!LocalFileIsNewer(client, file, remotePath) && FileSizesAreEqual(client, file, remotePath))
-                        {
-                            task.Increment(1);
-                            return;
-                        }
-                        
-                        task.Description = $"[green]Uploading file: [/][blue]{Markup.Escape(remotePath)}[/]";
-                        IAsyncResult asyncResult = client.BeginUploadFile(fileStream, remotePath);
-                        await Task.Factory.FromAsync(asyncResult, ar => client.EndUploadFile(ar));
-
-                        task.Increment(1);
+                        await TryUploadFile(client, localPath, target, targetPath, file, task);
                     }
                     finally
                     {
                         semaphore.Release();
+                        task.Description = $"[green]Uploading {20 - semaphore.CurrentCount}/{files.Length} files[/]";
                     }
                 }));
             });
+    }
 
-        client.Disconnect();
+    private async Task TryUploadFile(SftpClient client, string localPath, BupperTarget target,
+        string targetPath,
+        string file, ProgressTask task)
+    {
+        string relativePath = Path.GetRelativePath(localPath, file);
+        string remotePath = Path.Combine(target.Folder, targetPath, relativePath).Replace("\\", "/");
+                        
+        string? fileFolder = Path.GetDirectoryName(relativePath);
+        string uploadFolder = (target.Folder + "/" + targetPath + "/" + fileFolder).Replace("\\", "/");
+        await CreateDirectoryIfNotExists(client, uploadFolder);
+
+        await using FileStream fileStream = new(file, FileMode.Open);
+                        
+        if (!LocalFileIsNewer(client, file, remotePath) && FileSizesAreEqual(client, file, remotePath))
+        {
+            task.Increment(1);
+            return;
+        }
+        
+        const int maxRetries = 3;
+        for (int i = 0; i < maxRetries; i++)
+        {
+            try
+            {
+                IAsyncResult asyncResult = client.BeginUploadFile(fileStream, remotePath);
+                await Task.Factory.FromAsync(asyncResult, client.EndUploadFile);
+                break;
+            } catch (Exception e)
+            {
+                if (i == maxRetries - 1)
+                {
+                    logger.LogError(e, "Failed to upload file: {File} to {RemoteFile} into {Folder}", file, remotePath, uploadFolder);
+                    throw;
+                }
+                                
+                if (e.Message.Contains("The session is not open."))
+                {
+                    await client.ConnectAsync(default);
+                }
+            }
+        }
+
+        task.Increment(1);
     }
 
     private static bool LocalFileIsNewer(SftpClient client, string localPath, string remotePath)
     {
         DateTime localLastModifiedTime = File.GetLastWriteTime(localPath);
-        DateTime remoteLastModifiedTime = client.GetLastWriteTime(remotePath);
-        
-        return localLastModifiedTime > remoteLastModifiedTime;
+        try
+        {
+            DateTime remoteLastModifiedTime = client.GetLastWriteTime(remotePath);
+            return localLastModifiedTime > remoteLastModifiedTime;   
+        } catch (SftpPathNotFoundException)
+        {
+            return true;
+        }
     }
     
     private static bool FileSizesAreEqual(SftpClient client, string localPath, string remotePath)
     {
         long localFileSize = new FileInfo(localPath).Length;
-        ISftpFile file = client.Get(remotePath);
-        return file.Attributes.Size == localFileSize;
+        try
+        {
+            ISftpFile file = client.Get(remotePath);
+            return file.Attributes.Size == localFileSize;
+        } catch (SftpPathNotFoundException)
+        {
+            return false;
+        }
     }
 
     private BupperDirectory GetDirectory(string folderPath)
