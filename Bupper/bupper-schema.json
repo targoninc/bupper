@@ -1,0 +1,64 @@
+{
+  "$schema": "http://json-schema.org/draft-04/schema#",
+  "title": "BupperSettings",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "Folders": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/BupperFolder"
+      }
+    },
+    "Targets": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/BupperTarget"
+      }
+    }
+  },
+  "definitions": {
+    "BupperFolder": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "Path": {
+          "type": "string"
+        },
+        "Name": {
+          "type": "string"
+        },
+        "Type": {
+          "$ref": "#/definitions/BupperFolderType"
+        }
+      }
+    },
+    "BupperFolderType": {
+      "type": "integer",
+      "description": "",
+      "x-enumNames": [
+        "ProjectsRoot",
+        "Folder"
+      ],
+      "enum": [
+        0,
+        1
+      ]
+    },
+    "BupperTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "Host": {
+          "type": "string"
+        },
+        "User": {
+          "type": "string"
+        },
+        "Folder": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}
