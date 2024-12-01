@@ -89,7 +89,7 @@ public class Worker(
         }
         
         stopwatch.Stop();
-        logger.LogInformation("Uploaded directory: {LocalPath} to {TargetHost} in {Elapsed}", directory.Path, target.Host, stopwatch.Elapsed);
+        logger.LogInformation("Uploaded directory: {LocalPath} to {TargetFolder} in {Elapsed}", directory.Path, target.Folder, stopwatch.Elapsed);
     }
     
     private async Task CreateDirectoryIfNotExists(SftpClient client, string targetPath)
@@ -106,7 +106,6 @@ public class Worker(
 
     private async Task UploadDirectory(SftpClient client, string localPath, BupperTarget target, string targetPath)
     {
-        logger.LogInformation("Uploading directory: {LocalPath} to {TargetHost}", localPath, target.Host);
         await CreateDirectoryIfNotExists(client, target.Folder + "/" + targetPath);
 
         string[] files = Directory.GetFiles(localPath, "*", SearchOption.AllDirectories);
@@ -130,7 +129,7 @@ public class Worker(
                     {
                         semaphore.Release();
                         done++;
-                        task.Description = $"[green]Uploading | {20 - semaphore.CurrentCount} RUNNING | {done} / {files.Length} DONE[/]";
+                        //task.Description = $"[green]Uploading | {20 - semaphore.CurrentCount} RUNNING | {done} / {files.Length} DONE[/]";
                     }
                 }));
             });
@@ -142,28 +141,30 @@ public class Worker(
     {
         string relativePath = Path.GetRelativePath(localPath, file);
         string remotePath =
-            Path.Combine(target.Folder, targetPath, relativePath).Replace("\\", "/") + ".gz"; // Add .gz extension
+            Path.Combine(target.Folder, targetPath, relativePath).Replace("\\", "/") + ".gz";
 
-        string? fileFolder = Path.GetDirectoryName(relativePath);
-        string uploadFolder = (target.Folder + "/" + targetPath + "/" + fileFolder).Replace("\\", "/");
-        await CreateDirectoryIfNotExists(client, uploadFolder);
+        await using FileStream fileStream = new(file, FileMode.Open, FileAccess.Read);
+        await using MemoryStream compressedStream = new();
+        await using GZipStream compressionStream = new(compressedStream, CompressionMode.Compress);
 
-        if (!LocalFileIsNewer(client, file, remotePath) && FileSizesAreEqual(client, file, remotePath))
+        await fileStream.CopyToAsync(compressionStream);
+        long compressedSize = compressedStream.Length;
+        bool localIsNewer = LocalFileIsNewer(client, file, remotePath);
+        if (!localIsNewer && FileSizesAreEqual(client, compressedSize, remotePath))
         {
             task.Increment(1);
             return;
         }
-
+        
+        string? fileFolder = Path.GetDirectoryName(relativePath);
+        string uploadFolder = (target.Folder + "/" + targetPath + "/" + fileFolder).Replace("\\", "/");
+        await CreateDirectoryIfNotExists(client, uploadFolder);
+        
         const int maxRetries = 3;
         for (int i = 0; i < maxRetries; i++)
         {
             try
             {
-                await using FileStream fileStream = new(file, FileMode.Open, FileAccess.Read);
-                await using MemoryStream compressedStream = new();
-                await using GZipStream compressionStream = new(compressedStream, CompressionMode.Compress);
-
-                await fileStream.CopyToAsync(compressionStream);
                 compressedStream.Seek(0, SeekOrigin.Begin);
 
                 IAsyncResult asyncResult = client.BeginUploadFile(compressedStream, remotePath);
@@ -184,6 +185,10 @@ public class Worker(
                     e.Message.Contains("Cannot access a disposed object."))
                 {
                     await TryToReconnectSftp(client);
+                }
+                else
+                {
+                    logger.LogWarning(e,"Failed to upload file, retrying ({RemotePath})", remotePath);
                 }
             }
         }
@@ -225,9 +230,8 @@ public class Worker(
         }
     }
     
-    private static bool FileSizesAreEqual(SftpClient client, string localPath, string remotePath)
+    private static bool FileSizesAreEqual(SftpClient client, long localFileSize, string remotePath)
     {
-        long localFileSize = new FileInfo(localPath).Length;
         try
         {
             ISftpFile file = client.Get(remotePath);
