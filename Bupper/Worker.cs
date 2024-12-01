@@ -18,6 +18,7 @@ public class Worker(
     private static readonly IPrivateKeySource KeyFile =
         new PrivateKeyFile(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".ssh",
             "id_rsa"));
+    private static readonly SemaphoreSlim SftpConnectionSemaphore = new(1);
     
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -28,10 +29,13 @@ public class Worker(
                 logger.LogInformation("folder count: {FolderCount}", settings.CurrentValue.Folders.Count);
             }
             
+            Stopwatch stopwatch = Stopwatch.StartNew();
             foreach (BupperFolder folder in settings.CurrentValue.Folders)
             {
                 await SyncFolder(folder);
             }
+            stopwatch.Stop();
+            logger.LogInformation("Synced all folders in {Elapsed}", stopwatch.Elapsed);
             
             await Task.Delay(60000, stoppingToken);
         }
@@ -50,6 +54,7 @@ public class Worker(
     private async Task SyncProjectsRoot(string basePath, string baseName, BupperDirectory directory)
     {
         logger.LogInformation("Syncing projects root: {Path}", basePath);
+        Stopwatch stopwatch = Stopwatch.StartNew();
         foreach (BupperTarget target in settings.CurrentValue.Targets)
         {
             using SftpClient client = new(target.Host, target.User, KeyFile);
@@ -63,6 +68,8 @@ public class Worker(
             }
             client.Disconnect();
         }
+        stopwatch.Stop();
+        logger.LogInformation("Synced projects root: {Path} to all targets in {Elapsed}", basePath, stopwatch.Elapsed);
     }
     
     private async Task SyncDirectory(SftpClient client, string baseFolder, string baseName, BupperDirectory directory,
@@ -70,6 +77,7 @@ public class Worker(
     {
         string dirRelative = directory.Path.Replace(baseFolder, "");
         string dir = dirRelative.TrimStart('\\');
+        Stopwatch stopwatch = Stopwatch.StartNew();
         
         if (dir.Length > 0)
         {
@@ -79,6 +87,9 @@ public class Worker(
         {
             await UploadDirectory(client, directory.Path, target, baseName);
         }
+        
+        stopwatch.Stop();
+        logger.LogInformation("Uploaded directory: {LocalPath} to {TargetHost} in {Elapsed}", directory.Path, target.Host, stopwatch.Elapsed);
     }
     
     private async Task CreateDirectoryIfNotExists(SftpClient client, string targetPath)
@@ -105,11 +116,12 @@ public class Worker(
             {
                 ProgressTask task = ctx.AddTask("[green]Uploading files[/]", maxValue: files.Length);
                 SemaphoreSlim semaphore = new(20);
+                int done = 0;
 
                 await Task.WhenAll(files.Select(async file =>
                 {
                     await semaphore.WaitAsync();
-                    task.Description = $"[green]Uploading {20 - semaphore.CurrentCount}/{files.Length} files[/]";
+                    task.Description = $"[green]Uploading | {20 - semaphore.CurrentCount} RUNNING | {done} / {files.Length} DONE[/]";
                     try
                     {
                         await TryUploadFile(client, localPath, target, targetPath, file, task);
@@ -117,7 +129,8 @@ public class Worker(
                     finally
                     {
                         semaphore.Release();
-                        task.Description = $"[green]Uploading {20 - semaphore.CurrentCount}/{files.Length} files[/]";
+                        done++;
+                        task.Description = $"[green]Uploading | {20 - semaphore.CurrentCount} RUNNING | {done} / {files.Length} DONE[/]";
                     }
                 }));
             });
@@ -157,10 +170,21 @@ public class Worker(
                     logger.LogError(e, "Failed to upload file: {File} to {RemoteFile} into {Folder}", file, remotePath, uploadFolder);
                     throw;
                 }
-                                
-                if (e.Message.Contains("The session is not open."))
+                
+                if (e.Message.Contains("The session is not open.") || e.Message.Contains("Cannot access a disposed object."))
                 {
-                    await client.ConnectAsync(default);
+                    await SftpConnectionSemaphore.WaitAsync();
+                    try
+                    {
+                        if (!client.IsConnected)
+                        {
+                            await client.ConnectAsync(default);
+                        }
+                    }
+                    finally
+                    {
+                        SftpConnectionSemaphore.Release();                        
+                    }
                 }
             }
         }
