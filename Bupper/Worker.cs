@@ -163,13 +163,9 @@ public class Worker(
                 await using MemoryStream compressedStream = new();
                 await using GZipStream compressionStream = new(compressedStream, CompressionMode.Compress);
 
-                // Compress the file stream
                 await fileStream.CopyToAsync(compressionStream);
-
-                // Reset the position of the compressed stream for reading
                 compressedStream.Seek(0, SeekOrigin.Begin);
 
-                // Upload the compressed data stream
                 IAsyncResult asyncResult = client.BeginUploadFile(compressedStream, remotePath);
                 await Task.Factory.FromAsync(asyncResult, client.EndUploadFile);
 
@@ -194,7 +190,7 @@ public class Worker(
 
         task.Increment(1);
     }
-
+    
     private static async Task TryToReconnectSftp(SftpClient client)
     {
         await SftpConnectionSemaphore.WaitAsync();
@@ -217,8 +213,13 @@ public class Worker(
         try
         {
             DateTime remoteLastModifiedTime = client.GetLastWriteTime(remotePath);
-            return localLastModifiedTime > remoteLastModifiedTime;   
-        } catch (SftpPathNotFoundException)
+            return localLastModifiedTime > remoteLastModifiedTime;
+        }
+        catch (SftpPathNotFoundException)
+        {
+            return true;
+        }
+        catch (SshException)
         {
             return true;
         }
@@ -234,6 +235,10 @@ public class Worker(
         } catch (SftpPathNotFoundException)
         {
             return false;
+        }
+        catch (SshException)
+        {
+            return true;
         }
     }
 
