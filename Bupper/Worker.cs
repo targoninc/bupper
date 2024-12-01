@@ -43,7 +43,7 @@ public class Worker(
 
     private async Task SyncFolder(BupperFolder folder)
     {
-        BupperDirectory directory = GetDirectory(folder.Path);
+        BupperDirectory directory = IoHelper.GetDirectory(folder.Path);
 
         if (folder.Type == BupperFolderType.ProjectsRoot)
         {
@@ -60,7 +60,7 @@ public class Worker(
             using SftpClient client = new(target.Host, target.User, KeyFile);
             await client.ConnectAsync(default);
 
-            await CreateDirectoryIfNotExists(client, target.Folder + "/" + baseName);
+            await SftpActions.CreateSftpDirectoryIfNotExists(client, target.Folder + "/" + baseName);
 
             foreach (BupperDirectory project in directory.Directories)
             {
@@ -91,22 +91,10 @@ public class Worker(
         stopwatch.Stop();
         logger.LogInformation("Uploaded directory: {LocalPath} to {TargetFolder} in {Elapsed}", directory.Path, target.Folder, stopwatch.Elapsed);
     }
-    
-    private async Task CreateDirectoryIfNotExists(SftpClient client, string targetPath)
-    {
-        try
-        {
-            await client.CreateDirectoryAsync(targetPath);
-        }
-        catch (Exception e)
-        {
-            // ignored
-        }
-    }
 
     private async Task UploadDirectory(SftpClient client, string localPath, BupperTarget target, string targetPath)
     {
-        await CreateDirectoryIfNotExists(client, target.Folder + "/" + targetPath);
+        await SftpActions.CreateSftpDirectoryIfNotExists(client, target.Folder + "/" + targetPath);
 
         string[] files = Directory.GetFiles(localPath, "*", SearchOption.AllDirectories);
 
@@ -145,10 +133,10 @@ public class Worker(
 
         await using FileStream fileStream = new(file, FileMode.Open, FileAccess.Read);
         string tmpFileName = Path.GetTempFileName();
-        long compressedSize = await CompressAndGetSize(tmpFileName, fileStream);
+        long compressedSize = await IoHelper.CompressAndGetSize(tmpFileName, fileStream);
         
-        bool localIsNewer = LocalFileIsNewer(client, file, remotePath);
-        if (!localIsNewer && FileSizesAreEqual(client, compressedSize, remotePath))
+        bool localIsNewer = IoHelper.LocalFileIsNewer(client, file, remotePath);
+        if (!localIsNewer && IoHelper.FileSizesAreEqual(client, compressedSize, remotePath))
         {
             task.Increment(1);
             return;
@@ -164,40 +152,19 @@ public class Worker(
         task.Increment(1);
     }
 
-    private static async Task<long> CompressAndGetSize(string tmpFileName, FileStream fileStream)
-    {
-        long compressedSize;
-        await using (FileStream tmpFileStream = new(tmpFileName, FileMode.Create, FileAccess.Write))
-        {
-            await using GZipStream compressionStream = new(tmpFileStream, CompressionMode.Compress);
-            await fileStream.CopyToAsync(compressionStream);
-            
-            await fileStream.FlushAsync();
-            await tmpFileStream.FlushAsync();
-            await compressionStream.FlushAsync();
-            compressedSize = new FileInfo(tmpFileName).Length;
-        }
-
-        return compressedSize;
-    }
-
     private async Task UploadCompressedFileAsync(SftpClient client, BupperTarget target, string targetPath, string file,
         string relativePath, FileStream tmpFileStream, string remotePath)
     {
         string? fileFolder = Path.GetDirectoryName(relativePath);
         string uploadFolder = (target.Folder + "/" + targetPath + "/" + fileFolder).Replace("\\", "/");
-        await CreateDirectoryIfNotExists(client, uploadFolder);
+        await SftpActions.CreateSftpDirectoryIfNotExists(client, uploadFolder);
 
         const int maxRetries = 3;
         for (int i = 0; i < maxRetries; i++)
         {
             try
             {
-                tmpFileStream.Seek(0, SeekOrigin.Begin);
-
-                SftpFileStream outputStream = client.Open(remotePath, FileMode.OpenOrCreate, FileAccess.Write);
-                await tmpFileStream.CopyToAsync(outputStream);
-                await outputStream.FlushAsync();
+                await SftpActions.UploadFileStreamToSftp(client, tmpFileStream, remotePath);
                 break;
             }
             catch (SshException)
@@ -217,32 +184,6 @@ public class Worker(
                 await HandleFileUploadErrorAsync(client, e, remotePath);
             }
         }
-    }
-
-    private async Task DownloadAndDecompressFileAsync(SftpClient client, string remotePath)
-    {
-        SftpFileStream inputStream = client.OpenRead(remotePath);
-        string tmpFileName = Path.GetTempFileName();
-        string decomPressedFileName = Path.GetTempFileName();
-        await using (FileStream tmpFileStream = new(tmpFileName, FileMode.Create, FileAccess.ReadWrite))
-        {
-            await inputStream.CopyToAsync(tmpFileStream);
-            tmpFileStream.Seek(0, SeekOrigin.Begin);
-            
-            await DecompressFileStreamAsync(tmpFileStream, decomPressedFileName);
-        }
-        logger.LogWarning("Decompressed to: {FilePath}", decomPressedFileName);
-    }
-
-    private static async Task DecompressFileStreamAsync(FileStream tmpFileStream, string decompressedFileName)
-    {
-        await using GZipStream decompressionStream = new(tmpFileStream, CompressionMode.Decompress);
-        await using FileStream outputStream = new(decompressedFileName, FileMode.Create, FileAccess.ReadWrite);
-        await decompressionStream.CopyToAsync(outputStream);
-        
-        await tmpFileStream.FlushAsync();
-        await decompressionStream.FlushAsync();
-        await outputStream.FlushAsync();
     }
 
     private async Task HandleFileUploadErrorAsync(SftpClient client, Exception e, string remotePath)
@@ -272,47 +213,5 @@ public class Worker(
         {
             SftpConnectionSemaphore.Release();                        
         }
-    }
-
-    private static bool LocalFileIsNewer(SftpClient client, string localPath, string remotePath)
-    {
-        DateTime localLastModifiedTime = File.GetLastWriteTime(localPath);
-        try
-        {
-            DateTime remoteLastModifiedTime = client.GetLastWriteTime(remotePath);
-            return localLastModifiedTime > remoteLastModifiedTime;
-        }
-        catch (SftpPathNotFoundException)
-        {
-            return true;
-        }
-        catch (SshException)
-        {
-            return true;
-        }
-    }
-    
-    private bool FileSizesAreEqual(SftpClient client, long localFileSize, string remotePath)
-    {
-        try
-        {
-            ISftpFile file = client.Get(remotePath);
-            return file.Attributes.Size == localFileSize;
-        } catch (SftpPathNotFoundException)
-        {
-            return false;
-        }
-        catch (SshException)
-        {
-            return true;
-        }
-    }
-
-    private BupperDirectory GetDirectory(string folderPath)
-    {
-        string[] directories = Directory.GetDirectories(folderPath);
-        string[] files = Directory.GetFiles(folderPath);
-        
-        return new BupperDirectory(folderPath, files, directories.Select(GetDirectory).ToList());
     }
 }
