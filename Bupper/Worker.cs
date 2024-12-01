@@ -144,58 +144,77 @@ public class Worker(
             Path.Combine(target.Folder, targetPath, relativePath).Replace("\\", "/") + ".gz";
 
         await using FileStream fileStream = new(file, FileMode.Open, FileAccess.Read);
-        await using MemoryStream compressedStream = new();
-        await using GZipStream compressionStream = new(compressedStream, CompressionMode.Compress);
-
-        await fileStream.CopyToAsync(compressionStream);
-        long compressedSize = compressedStream.Length;
-        bool localIsNewer = LocalFileIsNewer(client, file, remotePath);
-        if (!localIsNewer && FileSizesAreEqual(client, compressedSize, remotePath))
+        string tmpFileName = Path.GetTempFileName();
+        await using (FileStream tmpFileStream = new(tmpFileName, FileMode.Create, FileAccess.ReadWrite))
         {
-            task.Increment(1);
-            return;
+            await using GZipStream compressionStream = new(tmpFileStream, CompressionMode.Compress);
+
+            await fileStream.CopyToAsync(compressionStream);
+
+            long compressedSize = tmpFileStream.Length;
+            bool localIsNewer = LocalFileIsNewer(client, file, remotePath);
+            if (!localIsNewer && FileSizesAreEqual(client, compressedSize, remotePath))
+            {
+                task.Increment(1);
+                return;
+            }
+
+            await UploadCompressedFileAsync(client, target, targetPath, file, relativePath, tmpFileStream, remotePath);
         }
-        
+        File.Delete(tmpFileName);
+        task.Increment(1);
+    }
+
+    private async Task UploadCompressedFileAsync(SftpClient client, BupperTarget target, string targetPath, string file,
+        string relativePath, FileStream tmpFileStream, string remotePath)
+    {
         string? fileFolder = Path.GetDirectoryName(relativePath);
         string uploadFolder = (target.Folder + "/" + targetPath + "/" + fileFolder).Replace("\\", "/");
         await CreateDirectoryIfNotExists(client, uploadFolder);
-        
+
         const int maxRetries = 3;
         for (int i = 0; i < maxRetries; i++)
         {
             try
             {
-                compressedStream.Seek(0, SeekOrigin.Begin);
+                tmpFileStream.Seek(0, SeekOrigin.Begin);
 
-                IAsyncResult asyncResult = client.BeginUploadFile(compressedStream, remotePath);
-                await Task.Factory.FromAsync(asyncResult, client.EndUploadFile);
-
+                SftpFileStream outputStream = client.Open(remotePath, FileMode.OpenOrCreate, FileAccess.Write);
+                await tmpFileStream.CopyToAsync(outputStream);
                 break;
+            }
+            catch (SshException)
+            {
+                await TryToReconnectSftp(client);
             }
             catch (Exception e)
             {
                 if (i == maxRetries - 1)
                 {
-                    logger.LogError(e, "Failed to upload file: {File} to {RemoteFile} into {Folder}", file, remotePath,
+                    logger.LogError(e, "Failed to upload file: {File} to {RemoteFile} into {Folder}", file,
+                        remotePath,
                         uploadFolder);
                     throw;
                 }
 
-                if (e.Message.Contains("The session is not open.") ||
-                    e.Message.Contains("Cannot access a disposed object."))
-                {
-                    await TryToReconnectSftp(client);
-                }
-                else
-                {
-                    logger.LogWarning(e,"Failed to upload file, retrying ({RemotePath})", remotePath);
-                }
+                await HandleFileUploadErrorAsync(client, e, remotePath);
             }
         }
-
-        task.Increment(1);
     }
-    
+
+    private async Task HandleFileUploadErrorAsync(SftpClient client, Exception e, string remotePath)
+    {
+        if (e.Message.Contains("The session is not open.") ||
+            e.Message.Contains("Cannot access a disposed object."))
+        {
+            await TryToReconnectSftp(client);
+        }
+        else
+        {
+            logger.LogWarning(e,"Failed to upload file, retrying ({RemotePath})", remotePath);
+        }
+    }
+
     private static async Task TryToReconnectSftp(SftpClient client)
     {
         await SftpConnectionSemaphore.WaitAsync();
