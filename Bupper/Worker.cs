@@ -37,7 +37,7 @@ public class Worker(
             stopwatch.Stop();
             logger.LogInformation("Synced all folders in {Elapsed}", stopwatch.Elapsed);
             
-            await Task.Delay(60000, stoppingToken);
+            await Task.Delay(60000 * 10, stoppingToken);
         }
     }
 
@@ -145,24 +145,40 @@ public class Worker(
 
         await using FileStream fileStream = new(file, FileMode.Open, FileAccess.Read);
         string tmpFileName = Path.GetTempFileName();
-        await using (FileStream tmpFileStream = new(tmpFileName, FileMode.Create, FileAccess.ReadWrite))
+        long compressedSize = await CompressAndGetSize(tmpFileName, fileStream);
+        
+        bool localIsNewer = LocalFileIsNewer(client, file, remotePath);
+        if (!localIsNewer && FileSizesAreEqual(client, compressedSize, remotePath))
         {
-            await using GZipStream compressionStream = new(tmpFileStream, CompressionMode.Compress);
-
-            await fileStream.CopyToAsync(compressionStream);
-
-            long compressedSize = tmpFileStream.Length;
-            bool localIsNewer = LocalFileIsNewer(client, file, remotePath);
-            if (!localIsNewer && FileSizesAreEqual(client, compressedSize, remotePath))
-            {
-                task.Increment(1);
-                return;
-            }
-
-            await UploadCompressedFileAsync(client, target, targetPath, file, relativePath, tmpFileStream, remotePath);
+            task.Increment(1);
+            return;
         }
+
+        await using (FileStream readTmpFileStream = new(tmpFileName, FileMode.Open, FileAccess.Read))
+        {
+            await UploadCompressedFileAsync(client, target, targetPath, file, relativePath, readTmpFileStream,
+                remotePath);
+        }
+        
         File.Delete(tmpFileName);
         task.Increment(1);
+    }
+
+    private static async Task<long> CompressAndGetSize(string tmpFileName, FileStream fileStream)
+    {
+        long compressedSize;
+        await using (FileStream tmpFileStream = new(tmpFileName, FileMode.Create, FileAccess.Write))
+        {
+            await using GZipStream compressionStream = new(tmpFileStream, CompressionMode.Compress);
+            await fileStream.CopyToAsync(compressionStream);
+            
+            await fileStream.FlushAsync();
+            await tmpFileStream.FlushAsync();
+            await compressionStream.FlushAsync();
+            compressedSize = new FileInfo(tmpFileName).Length;
+        }
+
+        return compressedSize;
     }
 
     private async Task UploadCompressedFileAsync(SftpClient client, BupperTarget target, string targetPath, string file,
@@ -181,6 +197,7 @@ public class Worker(
 
                 SftpFileStream outputStream = client.Open(remotePath, FileMode.OpenOrCreate, FileAccess.Write);
                 await tmpFileStream.CopyToAsync(outputStream);
+                await outputStream.FlushAsync();
                 break;
             }
             catch (SshException)
@@ -200,6 +217,32 @@ public class Worker(
                 await HandleFileUploadErrorAsync(client, e, remotePath);
             }
         }
+    }
+
+    private async Task DownloadAndDecompressFileAsync(SftpClient client, string remotePath)
+    {
+        SftpFileStream inputStream = client.OpenRead(remotePath);
+        string tmpFileName = Path.GetTempFileName();
+        string decomPressedFileName = Path.GetTempFileName();
+        await using (FileStream tmpFileStream = new(tmpFileName, FileMode.Create, FileAccess.ReadWrite))
+        {
+            await inputStream.CopyToAsync(tmpFileStream);
+            tmpFileStream.Seek(0, SeekOrigin.Begin);
+            
+            await DecompressFileStreamAsync(tmpFileStream, decomPressedFileName);
+        }
+        logger.LogWarning("Decompressed to: {FilePath}", decomPressedFileName);
+    }
+
+    private static async Task DecompressFileStreamAsync(FileStream tmpFileStream, string decompressedFileName)
+    {
+        await using GZipStream decompressionStream = new(tmpFileStream, CompressionMode.Decompress);
+        await using FileStream outputStream = new(decompressedFileName, FileMode.Create, FileAccess.ReadWrite);
+        await decompressionStream.CopyToAsync(outputStream);
+        
+        await tmpFileStream.FlushAsync();
+        await decompressionStream.FlushAsync();
+        await outputStream.FlushAsync();
     }
 
     private async Task HandleFileUploadErrorAsync(SftpClient client, Exception e, string remotePath)
@@ -249,7 +292,7 @@ public class Worker(
         }
     }
     
-    private static bool FileSizesAreEqual(SftpClient client, long localFileSize, string remotePath)
+    private bool FileSizesAreEqual(SftpClient client, long localFileSize, string remotePath)
     {
         try
         {
