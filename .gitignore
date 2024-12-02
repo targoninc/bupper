@@ -8,3 +8,5 @@ riderModule.iml
 *.DotSettings.user
 bupper-options.json
 .vs
+
+node_modules

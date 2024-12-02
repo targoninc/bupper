@@ -25,16 +25,18 @@ if (app.Environment.IsDevelopment())
 
 app.UseHttpsRedirection();
 
-app.MapGet("/getConfig", () => app.Configuration.Get<BupperSettings>())
+app.MapGet("/config", () => app.Configuration.Get<BupperSettings>())
     .WithName("GetConfig")
     .WithOpenApi();
 
-app.MapPut("/setConfig", (BupperSettings settings) =>
+JsonSerializerOptions serializerOptions = new()
+{
+    WriteIndented = true
+};
+
+app.MapPut("/config", (BupperSettings settings) =>
     {
-        File.WriteAllText(configurationFileName, JsonSerializer.Serialize(settings, new JsonSerializerOptions
-        {
-            WriteIndented = true
-        }));
+        File.WriteAllText(configurationFileName, JsonSerializer.Serialize(settings, serializerOptions));
         return Results.Ok();
     })
     .WithName("SetConfig")
