@@ -1,11 +1,9 @@
 using System.Diagnostics;
-using System.IO.Compression;
 using Bupper.Models;
 using Bupper.Models.Settings;
 using Microsoft.Extensions.Options;
 using Renci.SshNet;
 using Renci.SshNet.Common;
-using Renci.SshNet.Sftp;
 using Spectre.Console;
 
 namespace Bupper;
@@ -32,39 +30,39 @@ public class Worker(
             Stopwatch stopwatch = Stopwatch.StartNew();
             foreach (BupperFolder folder in settings.CurrentValue.Folders)
             {
-                await SyncFolder(folder);
+                await SyncFolderAsync(folder).ConfigureAwait(false);
             }
             stopwatch.Stop();
             logger.LogInformation("Synced all folders in {Elapsed}", stopwatch.Elapsed);
             
-            await Task.Delay(60000 * 10, stoppingToken);
+            await Task.Delay(60000 * 10, stoppingToken).ConfigureAwait(false);
         }
     }
 
-    private async Task SyncFolder(BupperFolder folder)
+    private async Task SyncFolderAsync(BupperFolder folder)
     {
         BupperDirectory directory = IoHelper.GetDirectory(folder.Path);
 
         if (folder.Type == BupperFolderType.ProjectsRoot)
         {
-            await SyncProjectsRoot(folder.Path, folder.Name, directory);
+            await SyncProjectsRootAsync(folder.Path, folder.Name, directory).ConfigureAwait(false);
         }
     }
 
-    private async Task SyncProjectsRoot(string basePath, string baseName, BupperDirectory directory)
+    private async Task SyncProjectsRootAsync(string basePath, string baseName, BupperDirectory directory)
     {
         logger.LogInformation("Syncing projects root: {Path}", basePath);
         Stopwatch stopwatch = Stopwatch.StartNew();
         foreach (BupperTarget target in settings.CurrentValue.Targets)
         {
             using SftpClient client = new(target.Host, target.User, KeyFile);
-            await client.ConnectAsync(default);
+            await client.ConnectAsync(default).ConfigureAwait(false);
 
-            await SftpActions.CreateSftpDirectoryIfNotExists(client, target.Folder + "/" + baseName);
+            await SftpActions.CreateSftpDirectoryIfNotExists(client, target.Folder + "/" + baseName).ConfigureAwait(false);
 
             foreach (BupperDirectory project in directory.Directories)
             {
-                await SyncDirectory(client, basePath, baseName, project, target);
+                await SyncDirectoryAsync(client, basePath, baseName, project, target).ConfigureAwait(false);
             }
             client.Disconnect();
         }
@@ -72,46 +70,44 @@ public class Worker(
         logger.LogInformation("Synced projects root: {Path} to all targets in {Elapsed}", basePath, stopwatch.Elapsed);
     }
     
-    private async Task SyncDirectory(SftpClient client, string baseFolder, string baseName, BupperDirectory directory,
+    private async Task SyncDirectoryAsync(SftpClient client, string baseFolder, string baseName, BupperDirectory directory,
         BupperTarget target)
     {
         string dirRelative = directory.Path.Replace(baseFolder, "");
         string dir = dirRelative.TrimStart('\\');
         Stopwatch stopwatch = Stopwatch.StartNew();
-        
+
+        string dirName = baseName;
         if (dir.Length > 0)
         {
-            await UploadDirectory(client, directory.Path, target, baseName + "/" + dir);
+            dirName += "/" + dir;
         }
-        else
-        {
-            await UploadDirectory(client, directory.Path, target, baseName);
-        }
+        await UploadDirectoryAsync(client, directory.Path, target, dirName).ConfigureAwait(false);
         
         stopwatch.Stop();
         logger.LogInformation("Uploaded directory: {LocalPath} to {TargetFolder} in {Elapsed}", directory.Path, target.Folder, stopwatch.Elapsed);
     }
 
-    private async Task UploadDirectory(SftpClient client, string localPath, BupperTarget target, string targetPath)
+    private async Task UploadDirectoryAsync(SftpClient client, string localPath, BupperTarget target, string targetPath)
     {
-        await SftpActions.CreateSftpDirectoryIfNotExists(client, target.Folder + "/" + targetPath);
+        await SftpActions.CreateSftpDirectoryIfNotExists(client, target.Folder + "/" + targetPath).ConfigureAwait(false);
 
         string[] files = Directory.GetFiles(localPath, "*", SearchOption.AllDirectories);
 
         await AnsiConsole.Progress()
-            .StartAsync(async ctx =>
+            .StartAsync(ctx =>
             {
                 ProgressTask task = ctx.AddTask("[green]Uploading files[/]", maxValue: files.Length);
                 SemaphoreSlim semaphore = new(20);
                 int done = 0;
 
-                await Task.WhenAll(files.Select(async file =>
+                return Task.WhenAll(files.Select(async file =>
                 {
-                    await semaphore.WaitAsync();
+                    await semaphore.WaitAsync().ConfigureAwait(false);
                     task.Description = $"[green]Uploading | {20 - semaphore.CurrentCount} RUNNING | {done} / {files.Length} DONE[/]";
                     try
                     {
-                        await TryUploadFile(client, localPath, target, targetPath, file, task);
+                        await TryUploadFileAsync(client, localPath, target, targetPath, file, task).ConfigureAwait(false);
                     }
                     finally
                     {
@@ -120,10 +116,10 @@ public class Worker(
                         //task.Description = $"[green]Uploading | {20 - semaphore.CurrentCount} RUNNING | {done} / {files.Length} DONE[/]";
                     }
                 }));
-            });
+            }).ConfigureAwait(false);
     }
 
-    private async Task TryUploadFile(SftpClient client, string localPath, BupperTarget target,
+    private async Task TryUploadFileAsync(SftpClient client, string localPath, BupperTarget target,
         string targetPath,
         string file, ProgressTask task)
     {
@@ -133,7 +129,7 @@ public class Worker(
 
         await using FileStream fileStream = new(file, FileMode.Open, FileAccess.Read);
         string tmpFileName = Path.GetTempFileName();
-        long compressedSize = await IoHelper.CompressAndGetSize(tmpFileName, fileStream);
+        long compressedSize = await IoHelper.CompressAndGetSize(tmpFileName, fileStream).ConfigureAwait(false);
         
         bool localIsNewer = IoHelper.LocalFileIsNewer(client, file, remotePath);
         if (!localIsNewer && IoHelper.FileSizesAreEqual(client, compressedSize, remotePath))
@@ -145,7 +141,7 @@ public class Worker(
         await using (FileStream readTmpFileStream = new(tmpFileName, FileMode.Open, FileAccess.Read))
         {
             await UploadCompressedFileAsync(client, target, targetPath, file, relativePath, readTmpFileStream,
-                remotePath);
+                remotePath).ConfigureAwait(false);
         }
         
         File.Delete(tmpFileName);
@@ -157,19 +153,19 @@ public class Worker(
     {
         string? fileFolder = Path.GetDirectoryName(relativePath);
         string uploadFolder = (target.Folder + "/" + targetPath + "/" + fileFolder).Replace("\\", "/");
-        await SftpActions.CreateSftpDirectoryIfNotExists(client, uploadFolder);
+        await SftpActions.CreateSftpDirectoryIfNotExists(client, uploadFolder).ConfigureAwait(false);
 
         const int maxRetries = 3;
         for (int i = 0; i < maxRetries; i++)
         {
             try
             {
-                await SftpActions.UploadFileStreamToSftp(client, tmpFileStream, remotePath);
+                await SftpActions.UploadFileStreamToSftp(client, tmpFileStream, remotePath).ConfigureAwait(false);
                 break;
             }
             catch (SshException)
             {
-                await TryToReconnectSftp(client);
+                await TryToReconnectSftpAsync(client).ConfigureAwait(false);
             }
             catch (Exception e)
             {
@@ -181,7 +177,7 @@ public class Worker(
                     throw;
                 }
 
-                await HandleFileUploadErrorAsync(client, e, remotePath);
+                await HandleFileUploadErrorAsync(client, e, remotePath).ConfigureAwait(false);
             }
         }
     }
@@ -191,7 +187,7 @@ public class Worker(
         if (e.Message.Contains("The session is not open.") ||
             e.Message.Contains("Cannot access a disposed object."))
         {
-            await TryToReconnectSftp(client);
+            await TryToReconnectSftpAsync(client).ConfigureAwait(false);
         }
         else
         {
@@ -199,14 +195,14 @@ public class Worker(
         }
     }
 
-    private static async Task TryToReconnectSftp(SftpClient client)
+    private static async Task TryToReconnectSftpAsync(SftpClient client)
     {
-        await SftpConnectionSemaphore.WaitAsync();
+        await SftpConnectionSemaphore.WaitAsync().ConfigureAwait(false);
         try
         {
             if (!client.IsConnected)
             {
-                await client.ConnectAsync(default);
+                await client.ConnectAsync(default).ConfigureAwait(false);
             }
         }
         finally
