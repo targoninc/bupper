@@ -1,6 +1,7 @@
 using System.Diagnostics;
-using Bupper.Models;
-using Bupper.Models.Settings;
+using BupperLibrary;
+using BupperLibrary.Models;
+using BupperLibrary.Models.Settings;
 using Microsoft.Extensions.Options;
 using Renci.SshNet;
 using Renci.SshNet.Common;
@@ -20,13 +21,19 @@ public class Worker(
     
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        await IoHelper.EnsureConfigDirectoryExistsAsync().ConfigureAwait(false);
+        
         while (!stoppingToken.IsCancellationRequested)
         {
-            if (logger.IsEnabled(LogLevel.Information))
+            if (settings.CurrentValue?.Folders == null || settings.CurrentValue.Folders.Count == 0)
             {
-                logger.LogInformation("folder count: {FolderCount}", settings.CurrentValue.Folders.Count);
+                logger.LogWarning("No folders configured, skipping sync");
+                await Task.Delay(60000 * 10, stoppingToken).ConfigureAwait(false);
+                continue;
             }
-            
+
+            logger.LogInformation("folder count: {FolderCount}", settings.CurrentValue.Folders.Count);
+
             Stopwatch stopwatch = Stopwatch.StartNew();
             foreach (BupperFolder folder in settings.CurrentValue.Folders)
             {
@@ -129,7 +136,7 @@ public class Worker(
 
         await using FileStream fileStream = new(file, FileMode.Open, FileAccess.Read);
         string tmpFileName = Path.GetTempFileName();
-        long compressedSize = await IoHelper.CompressAndGetSize(tmpFileName, fileStream).ConfigureAwait(false);
+        long compressedSize = await IoHelper.CompressAndGetSizeAsync(tmpFileName, fileStream).ConfigureAwait(false);
         
         bool localIsNewer = IoHelper.LocalFileIsNewer(client, file, remotePath);
         if (!localIsNewer && IoHelper.FileSizesAreEqual(client, compressedSize, remotePath))

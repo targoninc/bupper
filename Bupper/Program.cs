@@ -1,6 +1,5 @@
 using Bupper;
-using Bupper.Models;
-using Bupper.Models.Settings;
+using BupperLibrary.Models.Settings;
 using NJsonSchema;
 
 HostApplicationBuilder builder = Host.CreateApplicationBuilder(args);

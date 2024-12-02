@@ -1,0 +1,6 @@
+@BupperApi_HostAddress = http://localhost:5148
+
+GET {{BupperApi_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

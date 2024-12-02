@@ -1,13 +1,36 @@
 ﻿using System.IO.Compression;
-using Bupper.Models;
+using BupperLibrary.Models;
 using Renci.SshNet;
 using Renci.SshNet.Common;
 using Renci.SshNet.Sftp;
 
-namespace Bupper;
+namespace BupperLibrary;
 
 public static class IoHelper
 {
+    public static string GetConfigDirectory()
+    {
+        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "TargonInc", "Bupper", "Config");
+    }
+    
+    public static Task EnsureConfigDirectoryExistsAsync()
+    {
+        string configDirectory = GetConfigDirectory();
+        if (!Directory.Exists(configDirectory))
+        {
+            Directory.CreateDirectory(configDirectory);
+        }
+        
+        string configFile = Path.Combine(configDirectory, "bupper-options.json");
+        Console.WriteLine(configFile);
+        if (!File.Exists(configFile))
+        {
+            File.WriteAllText(configFile, "{}");
+        }
+
+        return Task.CompletedTask;
+    }
+    
     public static bool LocalFileIsNewer(SftpClient client, string localPath, string remotePath)
     {
         DateTime localLastModifiedTime = File.GetLastWriteTime(localPath);
@@ -26,15 +49,15 @@ public static class IoHelper
         }
     }
 
-    public static async Task<long> CompressAndGetSize(string tmpFileName, FileStream fileStream)
+    public static async Task<long> CompressAndGetSizeAsync(string tmpFileName, FileStream fileStream)
     {
         await using FileStream tmpFileStream = new(tmpFileName, FileMode.Create, FileAccess.Write);
         await using GZipStream compressionStream = new(tmpFileStream, CompressionMode.Compress);
-        await fileStream.CopyToAsync(compressionStream);
+        await fileStream.CopyToAsync(compressionStream).ConfigureAwait(false);
             
-        await fileStream.FlushAsync();
-        await tmpFileStream.FlushAsync();
-        await compressionStream.FlushAsync();
+        await fileStream.FlushAsync().ConfigureAwait(false);
+        await tmpFileStream.FlushAsync().ConfigureAwait(false);
+        await compressionStream.FlushAsync().ConfigureAwait(false);
         return new FileInfo(tmpFileName).Length;
     }
 
@@ -42,11 +65,11 @@ public static class IoHelper
     {
         await using GZipStream decompressionStream = new(tmpFileStream, CompressionMode.Decompress);
         await using FileStream outputStream = new(decompressedFileName, FileMode.Create, FileAccess.ReadWrite);
-        await decompressionStream.CopyToAsync(outputStream);
+        await decompressionStream.CopyToAsync(outputStream).ConfigureAwait(false);
         
-        await tmpFileStream.FlushAsync();
-        await decompressionStream.FlushAsync();
-        await outputStream.FlushAsync();
+        await tmpFileStream.FlushAsync().ConfigureAwait(false);
+        await decompressionStream.FlushAsync().ConfigureAwait(false);
+        await outputStream.FlushAsync().ConfigureAwait(false);
     }
     
     public static bool FileSizesAreEqual(SftpClient client, long localFileSize, string remotePath)

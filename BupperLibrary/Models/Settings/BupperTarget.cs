@@ -1,4 +1,4 @@
-﻿namespace Bupper.Models.Settings;
+﻿namespace BupperLibrary.Models.Settings;
 
 public record BupperTarget(
     string Host,

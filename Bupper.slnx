@@ -1,3 +1,5 @@
 ﻿<Solution>
+  <Project Path="BupperApi\BupperApi.csproj" Type="Classic C#" />
+  <Project Path="BupperLibrary\BupperLibrary.csproj" Type="Classic C#" />
   <Project Path="Bupper\Bupper.csproj" Type="Classic C#" />
 </Solution>

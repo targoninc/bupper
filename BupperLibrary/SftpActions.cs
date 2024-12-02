@@ -1,7 +1,7 @@
 ﻿using Renci.SshNet;
 using Renci.SshNet.Sftp;
 
-namespace Bupper;
+namespace BupperLibrary;
 
 public static class SftpActions
 {

@@ -19,4 +19,8 @@
         <Link>.gitignore</Link>
       </Content>
     </ItemGroup>
+
+    <ItemGroup>
+      <ProjectReference Include="..\BupperLibrary\BupperLibrary.csproj" />
+    </ItemGroup>
 </Project>
