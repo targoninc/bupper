@@ -58,7 +58,7 @@ public class Worker(
             using SftpClient client = new(target.Host, target.User, KeyFile);
             await client.ConnectAsync(default).ConfigureAwait(false);
 
-            await SftpActions.CreateSftpDirectoryIfNotExists(client, target.Folder + "/" + baseName).ConfigureAwait(false);
+            await SftpActions.CreateSftpDirectoryIfNotExistsAsync(client, target.Folder + "/" + baseName).ConfigureAwait(false);
 
             foreach (BupperDirectory project in directory.Directories)
             {
@@ -90,7 +90,7 @@ public class Worker(
 
     private async Task UploadDirectoryAsync(SftpClient client, string localPath, BupperTarget target, string targetPath)
     {
-        await SftpActions.CreateSftpDirectoryIfNotExists(client, target.Folder + "/" + targetPath).ConfigureAwait(false);
+        await SftpActions.CreateSftpDirectoryIfNotExistsAsync(client, target.Folder + "/" + targetPath).ConfigureAwait(false);
 
         string[] files = Directory.GetFiles(localPath, "*", SearchOption.AllDirectories);
 
@@ -153,19 +153,19 @@ public class Worker(
     {
         string? fileFolder = Path.GetDirectoryName(relativePath);
         string uploadFolder = (target.Folder + "/" + targetPath + "/" + fileFolder).Replace("\\", "/");
-        await SftpActions.CreateSftpDirectoryIfNotExists(client, uploadFolder).ConfigureAwait(false);
+        await SftpActions.CreateSftpDirectoryIfNotExistsAsync(client, uploadFolder).ConfigureAwait(false);
 
         const int maxRetries = 3;
         for (int i = 0; i < maxRetries; i++)
         {
             try
             {
-                await SftpActions.UploadFileStreamToSftp(client, tmpFileStream, remotePath).ConfigureAwait(false);
+                await SftpActions.UploadFileStreamToSftpAsync(client, tmpFileStream, remotePath).ConfigureAwait(false);
                 break;
             }
             catch (SshException)
             {
-                await TryToReconnectSftpAsync(client).ConfigureAwait(false);
+                await SftpActions.TryToReconnectSftpAsync(client, SftpConnectionSemaphore).ConfigureAwait(false);
             }
             catch (Exception e)
             {
@@ -187,27 +187,11 @@ public class Worker(
         if (e.Message.Contains("The session is not open.") ||
             e.Message.Contains("Cannot access a disposed object."))
         {
-            await TryToReconnectSftpAsync(client).ConfigureAwait(false);
+            await SftpActions.TryToReconnectSftpAsync(client, SftpConnectionSemaphore).ConfigureAwait(false);
         }
         else
         {
             logger.LogWarning(e,"Failed to upload file, retrying ({RemotePath})", remotePath);
-        }
-    }
-
-    private static async Task TryToReconnectSftpAsync(SftpClient client)
-    {
-        await SftpConnectionSemaphore.WaitAsync().ConfigureAwait(false);
-        try
-        {
-            if (!client.IsConnected)
-            {
-                await client.ConnectAsync(default).ConfigureAwait(false);
-            }
-        }
-        finally
-        {
-            SftpConnectionSemaphore.Release();                        
         }
     }
 }
